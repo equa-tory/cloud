@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""
+cloud - iCloud-style folder for an already-mounted network share (Linux + macOS).
+Needs only python3. Nothing is installed or changed on the server.
+
+  cloud init /mnt/nas/Projects ~/Cloud   create the local folder
+  cd ~/Cloud
+  cloud pin Game/Assets Game/Packages    download + keep (files or folders)
+  cloud unpin Game/Assets                upload changes, free the disk space
+  cloud sync [--every 60]                sync now (or keep syncing in a loop)
+  cloud auto on [SECONDS] | off          background sync (systemd timer / launchd)
+  cloud rm Game/Old                      delete from the server (goes to trash)
+  cloud status                           pinned items, auto sync, last sync
+  cloud uninit                           forget this folder (downloaded files stay)
+
+How it works
+  * Files you have not pinned show up as small "name.ext.cloud" stubs.
+  * Pinned files are kept in sync both ways. Edits, new files, renames AND
+    deletions are propagated; the newest edit wins. If both sides changed a file,
+    the older version is kept next to it as "name (conflict HOST DATE).ext".
+  * Deleted files are never really gone: they are moved to .cloud-trash/ (locally
+    and on the share) and purged after 30 days. A sync that would delete more
+    than 100 files is refused unless you run "cloud sync --force".
+  * Deleting a stub does nothing (it comes back); use "cloud rm" for that.
+  * Settings live in .cloudsync.json (exclude list, max_deletes, trash_days).
+    Unity's Library/, Temp/, obj/ ... are excluded by default: never synced.
+"""
+import argparse
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import plistlib
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+CFG, STATE, SUF = ".cloudsync.json", ".cloudsync.state.json", ".cloud"
+LOCK, LOG, TRASH = ".cloudsync.lock", ".cloudsync.log", ".cloud-trash"
+TOL = 1.0  # seconds: mtimes closer than this count as equal
+EXCLUDES = ["Library", "Temp", "obj", "Logs", "UserSettings", ".vs",
+            ".DS_Store", ".Trash*", "*.tmp"]
+
+root = remote = None
+cfg = {}
+state = {}
+QUIET = False
+
+
+class Stop(Exception):
+    """Clean abort with a message."""
+
+
+class Offline(Stop):
+    pass
+
+
+class Busy(Stop):
+    pass
+
+
+# ---------------------------------------------------------------- basics
+def out(msg):
+    if QUIET and root:
+        try:
+            p = os.path.join(root, LOG)
+            if os.path.exists(p) and os.path.getsize(p) > 500000:
+                os.remove(p)
+            with open(p, "a") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+        except OSError:
+            pass
+    else:
+        print(msg)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def save_cfg():
+    write_json(os.path.join(root, CFG), cfg)
+
+
+def save_state():
+    write_json(os.path.join(root, STATE), state)
+
+
+def load(start=None):
+    global root, remote, cfg, state
+    d = os.path.abspath(start or os.getcwd())
+    while not os.path.exists(os.path.join(d, CFG)):
+        if os.path.dirname(d) == d:
+            raise Stop("Not inside a cloud folder. Run: cloud init REMOTE_DIR LOCAL_DIR")
+        d = os.path.dirname(d)
+    root = d
+    cfg = read_json(os.path.join(d, CFG), {})
+    cfg.setdefault("pinned", [])
+    cfg.setdefault("exclude", list(EXCLUDES))
+    cfg.setdefault("max_deletes", 100)
+    cfg.setdefault("trash_days", 30)
+    cfg.setdefault("auto", 0)
+    remote = cfg["remote"]
+    state = read_json(os.path.join(d, STATE), {})
+    state.setdefault("files", {})
+    state.setdefault("dirs", [])
+
+
+def check_remote():
+    if not os.path.isdir(remote):
+        raise Offline(f"Server folder not available: {remote} (is the share mounted?)")
+    if not os.listdir(remote):  # Linux: an unmounted share leaves an empty mount point
+        raise Offline(f"Server folder is empty: {remote} - share probably not mounted, nothing done.")
+
+
+class locked(object):
+    def __enter__(self):
+        self.f = open(os.path.join(root, LOCK), "w")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.f.close()
+            raise Busy("Another sync is already running.")
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def local(rel):
+    return os.path.join(root, rel)
+
+
+def far(rel):
+    return os.path.join(remote, rel)
+
+
+def excluded(name):
+    return any(fnmatch.fnmatch(name, p) for p in cfg["exclude"])
+
+
+def bad(name):  # names the sync never touches, on either side
+    return (name.startswith(".cloudsync") or name == TRASH
+            or name.endswith(".cloudpart") or excluded(name))
+
+
+def to_rel(p):
+    p = os.path.abspath(p)
+    if p.endswith(SUF):
+        p = p[:-len(SUF)]
+    r = os.path.relpath(p, root)
+    if r == ".":
+        return ""
+    if r.startswith(".."):
+        raise Stop(f"Not inside the cloud folder: {p}")
+    return r
+
+
+def covered(rel):
+    return any(p == "" or rel == p or rel.startswith(p + "/") for p in cfg["pinned"])
+
+
+def under(rel, prefix):
+    return prefix == "" or rel == prefix or rel.startswith(prefix + "/")
+
+
+def sig(path):
+    st = os.stat(path)
+    return [st.st_size, st.st_mtime]
+
+
+def changed(a, b):
+    return a is None or b is None or a[0] != b[0] or abs(a[1] - b[1]) > TOL
+
+
+def rmf(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def copy_file(src, dst):
+    """Copy via a hidden temp file + rename, so nobody ever sees half a file."""
+    d = os.path.dirname(dst)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, "." + os.path.basename(dst) + ".cloudpart")
+    st = os.stat(src)
+    try:
+        shutil.copyfile(src, tmp)
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        st2 = os.stat(src)
+        if st2.st_size != st.st_size or st2.st_mtime_ns != st.st_mtime_ns:
+            raise OSError("changed while copying - will retry next sync")
+        os.replace(tmp, dst)
+    except BaseException:
+        rmf(tmp)
+        raise
+
+
+def trash(base, rel):
+    dest = os.path.join(base, TRASH, time.strftime("%Y%m%d"), rel)
+    if os.path.lexists(dest):
+        dest += time.strftime(".%H%M%S")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(os.path.join(base, rel), dest)
+
+
+def purge_trash(base):
+    days = cfg["trash_days"]
+    t = os.path.join(base, TRASH)
+    if days <= 0 or not os.path.isdir(t):
+        return
+    cutoff = time.time() - days * 86400
+    for n in os.listdir(t):
+        try:
+            if time.mktime(time.strptime(n[:8], "%Y%m%d")) < cutoff:
+                shutil.rmtree(os.path.join(t, n))
+        except (ValueError, OSError):
+            pass
+
+
+def write_stub(rel, size):
+    p = local(rel) + SUF
+    txt = f'Not downloaded ({size} bytes). To download: cloud pin "{rel}"\n'
+    try:
+        with open(p) as f:
+            if f.read() == txt:
+                return
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(txt)
+
+
+def conflict_name(rel):
+    base, ext = os.path.splitext(rel)
+    host = socket.gethostname().split(".")[0]
+    return f"{base} (conflict {host} {time.strftime('%Y%m%d-%H%M%S')}){ext}"
+
+
+# ---------------------------------------------------------------- scanning
+def _raise(e):
+    raise e
+
+
+def _scan(top, want_stubs):
+    files, dirs, stubs = {}, set(), set()
+    for dp, dns, fns in os.walk(top, onerror=_raise):
+        dns[:] = [d for d in dns if not bad(d)]
+        r = os.path.relpath(dp, top)
+        r = "" if r == "." else r
+        if r:
+            dirs.add(r)
+        for f in fns:
+            rel = os.path.join(r, f)
+            if want_stubs and f.endswith(SUF):
+                stubs.add(rel[:-len(SUF)])
+                continue
+            if bad(f):
+                continue
+            p = os.path.join(dp, f)
+            try:
+                files[rel] = sig(p)
+            except FileNotFoundError:
+                continue  # vanished (or broken symlink) while scanning: treat as gone
+            except OSError:
+                raise  # unreadable file: abort instead of guessing it was deleted
+    return files, dirs, stubs
+
+
+# ---------------------------------------------------------------- planning
+def plan(L, R, S):
+    acts = []
+    for rel in sorted(set(L) | set(R) | set(S)):
+        l, r, b = L.get(rel), R.get(rel), S.get(rel)
+        if l and r:
+            if b is None:
+                if not changed(l, r):
+                    acts.append(("record", rel))
+                else:
+                    acts.append(("up" if l[1] >= r[1] else "down", rel))
+            else:
+                lc, rc = changed(l, b["l"]), changed(r, b["r"])
+                if lc and rc:
+                    acts.append(("record" if not changed(l, r) else "conflict", rel))
+                elif lc:
+                    acts.append(("up", rel))
+                elif rc:
+                    acts.append(("down", rel))
+        elif l:  # only here
+            if b is None or changed(l, b["l"]):
+                acts.append(("up", rel))  # new, or edited after the server deleted it: keep it
+            else:
+                acts.append(("rm_local", rel))  # deleted on the server
+        elif r:  # only on the server
+            if b is not None:
+                acts.append(("down" if changed(r, b["r"]) else "rm_remote", rel))  # deleted here
+            elif covered(rel):
+                acts.append(("down", rel))  # new on the server, in a pinned place
+        elif b is not None:
+            acts.append(("forget", rel))
+    return acts
+
+
+# ---------------------------------------------------------------- sync
+def sync(force=False):
+    check_remote()
+    R, RD, _ = _scan(remote, False)
+    L, LD, stubs = _scan(root, True)
+    S = state["files"]
+    acts = plan(L, R, S)
+
+    ndel = sum(1 for k, _ in acts if k in ("rm_local", "rm_remote"))
+    if ndel > cfg["max_deletes"] and not force:
+        raise Stop(f"Refusing: this sync would delete {ndel} files (limit {cfg['max_deletes']}). "
+                   f"If that is what you want run: cloud sync --force")
+
+    def record(rel):
+        S[rel] = {"l": sig(local(rel)), "r": sig(far(rel))}
+        L[rel], R[rel] = S[rel]["l"], S[rel]["r"]
+
+    n = {"up": 0, "down": 0, "rm_local": 0, "rm_remote": 0, "conflict": 0}
+    errors = 0
+    for kind, rel in acts:
+        try:
+            if kind == "up":
+                copy_file(local(rel), far(rel))
+                record(rel)
+                out("  up   " + rel)
+            elif kind == "down":
+                copy_file(far(rel), local(rel))
+                record(rel)
+                out("  down " + rel)
+            elif kind == "record":
+                record(rel)
+            elif kind == "conflict":
+                local_wins = L[rel][1] >= R[rel][1]
+                keep = not rel.endswith(".meta")
+                if local_wins:
+                    if keep:
+                        shutil.move(far(rel), far(conflict_name(rel)))
+                    copy_file(local(rel), far(rel))
+                else:
+                    if keep:
+                        shutil.move(local(rel), local(conflict_name(rel)))
+                    copy_file(far(rel), local(rel))
+                record(rel)
+                out("  CONFLICT " + rel + " (newer one kept" + (", other saved next to it)" if keep else ")"))
+            elif kind == "rm_local":
+                trash(root, rel)
+                S.pop(rel, None)
+                L.pop(rel, None)
+                out("  deleted here (server deleted it) " + rel)
+            elif kind == "rm_remote":
+                trash(remote, rel)
+                S.pop(rel, None)
+                R.pop(rel, None)
+                out("  deleted on server (you deleted it) " + rel)
+            elif kind == "forget":
+                S.pop(rel, None)
+            if kind in n:
+                n[kind] += 1
+        except (OSError, shutil.Error) as e:
+            errors += 1
+            out(f"  ERROR {kind} {rel}: {e}")
+
+    # stubs that are obsolete (file downloaded, or gone from the server)
+    for rel in stubs:
+        if rel in L or rel not in R:
+            rmf(local(rel) + SUF)
+
+    # folders (so empty folders and their Unity .meta files stay consistent)
+    BD = set(state["dirs"])
+    cand = LD | RD | BD
+    mk_remote = sorted(d for d in cand if d in LD and d not in RD and d not in BD)
+    mk_local = sorted(d for d in cand if d in RD and d not in LD and d not in BD)
+    rm_local_d = sorted((d for d in cand if d in LD and d not in RD and d in BD), reverse=True)
+    rm_remote_d = sorted((d for d in cand if d in RD and d not in LD and d in BD), reverse=True)
+    keep_tracked = set()
+    for d in mk_remote:
+        try:
+            os.makedirs(far(d), exist_ok=True)
+        except OSError as e:
+            errors += 1
+            out(f"  ERROR mkdir on server {d}: {e}")
+    for d in mk_local:
+        os.makedirs(local(d), exist_ok=True)
+    for d, base in [(d, root) for d in rm_local_d] + [(d, remote) for d in rm_remote_d]:
+        try:
+            os.rmdir(os.path.join(base, d))
+        except OSError:
+            keep_tracked.add(d)  # not empty: leave it, but remember so it is not recreated
+
+    # stubs for everything on the server that is not here
+    for rel, sg in R.items():
+        if rel not in L:
+            write_stub(rel, sg[0])
+
+    state["dirs"] = sorted(
+        {d for d in cand if os.path.isdir(local(d)) and os.path.isdir(far(d))} | keep_tracked)
+    state["last"] = time.time()
+    save_state()
+    purge_trash(root)
+    purge_trash(remote)
+
+    total = sum(n.values())
+    if total == 0 and not errors:
+        if not QUIET:
+            out("Up to date.")
+    else:
+        out(f"Synced: {n['up']} up, {n['down']} down, "
+            f"{n['rm_local'] + n['rm_remote']} deleted, {n['conflict']} conflicts"
+            + (f", {errors} errors" if errors else ""))
+    return errors
+
+
+# ---------------------------------------------------------------- commands
+def cmd_init(a):
+    global root, remote, cfg, state
+    root, remote = os.path.abspath(a.local), os.path.abspath(a.remote)
+    if os.path.exists(os.path.join(root, CFG)):
+        raise Stop(f"{root} is already a cloud folder (cloud uninit first to redo it).")
+    os.makedirs(root, exist_ok=True)
+    cfg = {"remote": remote, "pinned": [], "exclude": list(EXCLUDES),
+           "max_deletes": 100, "trash_days": 30, "auto": 0}
+    state = {"files": {}, "dirs": []}
+    check_remote()
+    save_cfg()
+    save_state()
+    with locked():
+        sync()
+    print("Ready:", root)
+
+
+def cmd_sync(a):
+    global QUIET
+    QUIET = a.quiet
+    while True:
+        try:
+            with locked():
+                errs = sync(a.force)
+        except Stop as e:
+            if not a.every:
+                raise
+            if not isinstance(e, (Offline, Busy)):
+                out(str(e))
+            errs = 1
+        if not a.every:
+            sys.exit(1 if errs else 0)
+        try:
+            time.sleep(a.every)
+        except KeyboardInterrupt:
+            return
+
+
+def cmd_pin(a):
+    check_remote()
+    for p in a.paths:
+        rel = to_rel(p)
+        if not os.path.exists(far(rel)):
+            out("not on server: " + rel)
+            continue
+        if not covered(rel):
+            cfg["pinned"] = [x for x in cfg["pinned"] if not under(x, rel)]
+            cfg["pinned"].append(rel)
+    save_cfg()
+    if sync():
+        out("Some files failed - run 'cloud sync' again.")
+
+
+def cmd_unpin(a):
+    targets = []
+    for p in a.paths:
+        rel = to_rel(p)
+        if rel in cfg["pinned"]:
+            targets.append(rel)
+        else:
+            out("not pinned (if it is inside a pinned folder, unpin that folder): " + rel)
+    if not targets:
+        return
+    if sync():
+        raise Stop("Sync had errors - nothing was freed. Fix them and retry.")
+    S = state["files"]
+    L, _, _ = _scan(root, True)
+    for rel in targets:
+        for f in sorted(k for k in L if under(k, rel)):
+            b = S.get(f)
+            try:
+                rs = sig(far(f))
+            except OSError:
+                rs = None
+            if b is None or changed(L[f], b["l"]) or changed(rs, b["r"]):
+                out("  kept (not identical on the server): " + f)
+                continue
+            os.remove(local(f))
+            write_stub(f, rs[0])
+            S.pop(f, None)
+        cfg["pinned"].remove(rel)
+        out("unpinned " + (rel or "everything"))
+    save_cfg()
+    save_state()
+
+
+def cmd_rm(a):
+    check_remote()
+    S = state["files"]
+    for p in a.paths:
+        rel = to_rel(p)
+        if rel == "":
+            out("refusing to remove everything")
+            continue
+        if not os.path.lexists(far(rel)):
+            out("not on server: " + rel)
+            continue
+        trash(remote, rel)
+        for path in (local(rel), local(rel) + SUF):
+            if os.path.lexists(path):
+                trash(root, os.path.relpath(path, root))
+        for k in [k for k in S if under(k, rel)]:
+            del S[k]
+        state["dirs"] = [d for d in state["dirs"] if not under(d, rel)]
+        cfg["pinned"] = [x for x in cfg["pinned"] if not under(x, rel)]
+        out(f"removed {rel} (kept in .cloud-trash for {cfg['trash_days']} days)")
+    save_cfg()
+    save_state()
+
+
+def cmd_pinned(a):
+    print("\n".join(cfg["pinned"]) or "(nothing pinned)")
+
+
+def cmd_status(a):
+    try:
+        online = os.path.isdir(remote) and bool(os.listdir(remote))
+    except OSError:
+        online = False
+    last = state.get("last")
+    print(f"Cloud folder: {root}")
+    print(f"Server:       {remote} ({'online' if online else 'OFFLINE'})")
+    print(f"Auto sync:    {'every %d s' % cfg['auto'] if cfg['auto'] else 'off'}")
+    print(f"Last sync:    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last)) if last else 'never'}")
+    print("Pinned:       " + (", ".join(p or "(everything)" for p in cfg["pinned"]) or "(nothing)"))
+
+
+def cmd_uninit(a):
+    if not a.yes:
+        if input(f"Forget {root}? Stubs and settings are removed, downloaded files stay. [y/N] ").lower() != "y":
+            return
+    if cfg["auto"]:
+        auto_off()
+    for dp, _, fns in os.walk(root):
+        for f in fns:
+            if f.endswith(SUF):
+                rmf(os.path.join(dp, f))
+    for n in (CFG, STATE, LOCK, LOG):
+        rmf(os.path.join(root, n))
+    print("Done. Downloaded files are untouched; trash (if any) is in", os.path.join(root, TRASH))
+
+
+# ---------------------------------------------------------------- auto sync
+def svc_name():
+    return "cloudsync-" + hashlib.sha1(root.encode()).hexdigest()[:8]
+
+
+def svc_files():
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return [os.path.join(home, "Library", "LaunchAgents", f"com.{svc_name()}.plist")]
+    d = os.path.join(home, ".config", "systemd", "user")
+    return [os.path.join(d, svc_name() + ".service"), os.path.join(d, svc_name() + ".timer")]
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def auto_on(secs):
+    secs = max(30, secs)
+    cmd = [sys.executable, os.path.realpath(__file__), "-C", root, "sync", "--quiet"]
+    files = svc_files()
+    os.makedirs(os.path.dirname(files[0]), exist_ok=True)
+    if sys.platform == "darwin":
+        with open(files[0], "wb") as f:
+            plistlib.dump({"Label": f"com.{svc_name()}", "ProgramArguments": cmd,
+                           "StartInterval": secs, "RunAtLoad": True, "ProcessType": "Background",
+                           "StandardErrorPath": os.path.join(root, LOG)}, f)
+        uid = str(os.getuid())
+        sh("launchctl", "bootout", f"gui/{uid}", files[0])
+        ok = sh("launchctl", "bootstrap", f"gui/{uid}", files[0])
+    else:
+        exe = " ".join('"' + a.replace("%", "%%").replace('"', '\\"') + '"' for a in cmd)
+        with open(files[0], "w") as f:
+            f.write(f"[Unit]\nDescription=cloud sync of {root}\n\n[Service]\nType=oneshot\nExecStart={exe}\n")
+        with open(files[1], "w") as f:
+            f.write(f"[Unit]\nDescription=cloud sync timer for {root}\n\n[Timer]\n"
+                    f"OnBootSec=30\nOnUnitActiveSec={secs}s\n\n[Install]\nWantedBy=timers.target\n")
+        sh("systemctl", "--user", "daemon-reload")
+        ok = sh("systemctl", "--user", "enable", "--now", svc_name() + ".timer")
+    cfg["auto"] = secs if ok else 0
+    save_cfg()
+    if ok:
+        print(f"Auto sync ON: every {secs} s (log: {os.path.join(root, LOG)})")
+    else:
+        for f in files:  # don't leave half-installed service files around
+            rmf(f)
+        print("Could not start the background service here (no systemd/launchd?).\n"
+              f"Use instead, in a terminal: cloud sync --every {secs}")
+
+
+def auto_off():
+    files = svc_files()
+    if sys.platform == "darwin":
+        sh("launchctl", "bootout", f"gui/{os.getuid()}", files[0])
+    else:
+        sh("systemctl", "--user", "disable", "--now", svc_name() + ".timer")
+    for f in files:
+        rmf(f)
+    if sys.platform != "darwin":
+        sh("systemctl", "--user", "daemon-reload")
+    cfg["auto"] = 0
+    if os.path.exists(os.path.join(root, CFG)):
+        save_cfg()
+
+
+def cmd_auto(a):
+    if a.mode == "on":
+        auto_on(a.seconds)
+    elif a.mode == "off":
+        auto_off()
+        print("Auto sync OFF")
+    else:
+        print(f"Auto sync: {'ON, every %d s' % cfg['auto'] if cfg['auto'] else 'off'}")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    global QUIET
+    ap = argparse.ArgumentParser(prog="cloud", description="iCloud-style folder for a mounted share")
+    ap.add_argument("-C", dest="dir", help="cloud folder (default: the one you are in)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init", help="create a cloud folder")
+    i.add_argument("remote", help="mounted share directory")
+    i.add_argument("local", help="local cloud folder to create")
+    s = sub.add_parser("sync", help="sync now")
+    s.add_argument("--quiet", action="store_true", help="log to .cloudsync.log, print nothing")
+    s.add_argument("--force", action="store_true", help="allow deleting many files at once")
+    s.add_argument("--every", type=int, metavar="SECONDS", help="keep syncing in a loop")
+    for name, h in (("pin", "keep downloaded"), ("unpin", "free the disk space"),
+                    ("rm", "delete from the server (moved to trash)")):
+        sub.add_parser(name, help=h).add_argument("paths", nargs="+")
+    au = sub.add_parser("auto", help="background sync on/off")
+    au.add_argument("mode", nargs="?", choices=["on", "off"])
+    au.add_argument("seconds", nargs="?", type=int, default=120)
+    u = sub.add_parser("uninit", help="forget this folder, keep downloaded files")
+    u.add_argument("--yes", action="store_true")
+    sub.add_parser("status")
+    sub.add_parser("pinned")
+    a = ap.parse_args()
+    QUIET = getattr(a, "quiet", False)
+    try:
+        if a.cmd == "init":
+            cmd_init(a)
+            return
+        load(a.dir)
+        if a.cmd in ("pin", "unpin", "rm"):
+            with locked():
+                {"pin": cmd_pin, "unpin": cmd_unpin, "rm": cmd_rm}[a.cmd](a)
+        else:
+            {"sync": cmd_sync, "auto": cmd_auto, "status": cmd_status,
+             "pinned": cmd_pinned, "uninit": cmd_uninit}[a.cmd](a)
+    except (Offline, Busy) as e:
+        if QUIET:
+            sys.exit(0)
+        print(e)
+        sys.exit(1)
+    except Stop as e:
+        out(str(e))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as e:  # e.g. share dropped mid-sync: report cleanly, next sync retries
+        out(f"Error: {e} - nothing was lost, will retry on the next sync.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
