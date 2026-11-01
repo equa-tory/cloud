@@ -3,7 +3,8 @@
 cloud - iCloud-style folder for an already-mounted network share (Linux + macOS).
 Needs only python3. Nothing is installed or changed on the server.
 
-  cloud init /mnt/nas/Projects ~/Cloud   create the local folder
+  cloud                                  open the arrow-key folder manager
+  cloud init /mnt/nas/Projects ~/Cloud   create a local folder instantly (lazy browsing)
   cd ~/Cloud
   cloud pin Game/Assets Game/Packages    download + keep (files or folders)
   cloud unpin Game/Assets                upload changes, free the disk space
@@ -14,7 +15,9 @@ Needs only python3. Nothing is installed or changed on the server.
   cloud uninit                           forget this folder (downloaded files stay)
 
 How it works
-  * Files you have not pinned show up as small "name.ext.cloud" stubs.
+  * New connections browse one directory at a time; only selected paths are scanned.
+  * --full-index opts into small "name.ext.cloud" stubs for all remote files.
+  * Existing profiles keep their previous behavior until lazy browsing is enabled.
   * Pinned files are kept in sync both ways. Edits, new files, renames AND
     deletions are propagated; the newest edit wins. If both sides changed a file,
     the older version is kept next to it as "name (conflict HOST DATE).ext".
@@ -26,6 +29,11 @@ How it works
     Unity's Library/, Temp/, obj/ ... are excluded by default: never synced.
 """
 import argparse
+import contextlib
+import io
+import re
+import threading
+import types
 import fcntl
 import fnmatch
 import hashlib
@@ -34,6 +42,7 @@ import os
 import plistlib
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -114,6 +123,7 @@ def load(start=None):
     cfg.setdefault("max_deletes", 100)
     cfg.setdefault("trash_days", 30)
     cfg.setdefault("auto", 0)
+    cfg.setdefault("lazy", False)
     remote = cfg["remote"]
     state = read_json(os.path.join(d, STATE), {})
     state.setdefault("files", {})
@@ -123,8 +133,16 @@ def load(start=None):
 def check_remote():
     if not os.path.isdir(remote):
         raise Offline(f"Server folder not available: {remote} (is the share mounted?)")
-    if not os.listdir(remote):  # Linux: an unmounted share leaves an empty mount point
-        raise Offline(f"Server folder is empty: {remote} - share probably not mounted, nothing done.")
+    # A configured mount must actually be mounted, even if its bare directory exists.
+    for entry in mount_sources():
+        target = entry["target"]
+        if os.path.commonpath([remote, target]) == target:
+            if sys.platform == "linux" and not sh("mountpoint", "-q", target):
+                # Touching the directory also triggers an fstab automount.
+                os.listdir(remote)
+                if not sh("mountpoint", "-q", target):
+                    raise Offline(f"Share is not mounted: {target}")
+            break
 
 
 class locked(object):
@@ -165,7 +183,7 @@ def to_rel(p):
     r = os.path.relpath(p, root)
     if r == ".":
         return ""
-    if r.startswith(".."):
+    if r == ".." or r.startswith(".." + os.sep):
         raise Stop(f"Not inside the cloud folder: {p}")
     return r
 
@@ -284,6 +302,95 @@ def _scan(top, want_stubs):
     return files, dirs, stubs
 
 
+# ---------------------------------------------------------------- lazy selection / registry
+def selected_path(rel):
+    return covered(rel) or any(under(rel, p) for p in state.get("files", {}))
+
+
+def scan_selected(top, want_stubs):
+    files, dirs, stubs = {}, set(), set()
+    prefixes = sorted(set(cfg["pinned"]) | set(state.get("files", {})), key=lambda p: (p.count("/"), p))
+    chosen = []
+    for rel in prefixes:
+        if any(under(rel, p) for p in chosen):
+            continue
+        chosen.append(rel)
+        path = os.path.join(top, rel)
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            mode = 0
+        if stat.S_ISLNK(mode):
+            raise Stop("Selected symlink is not supported: " + rel)
+        if stat.S_ISDIR(mode):
+            fs, ds, ss = _scan(path, want_stubs)
+            files.update({os.path.join(rel, k): v for k, v in fs.items()})
+            dirs.update(os.path.join(rel, d) for d in ds)
+            stubs.update(os.path.join(rel, k) for k in ss)
+            if rel:
+                dirs.add(rel)
+        elif stat.S_ISREG(mode):
+            files[rel] = sig(path)
+        elif os.path.exists(path + SUF) and want_stubs:
+            stubs.add(rel)
+        # Include ancestors so selected children have matching local parents.
+        parent = os.path.dirname(rel)
+        while parent:
+            if os.path.isdir(os.path.join(top, parent)):
+                dirs.add(parent)
+            parent = os.path.dirname(parent)
+    return files, dirs, stubs
+
+
+def registry_path():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "cloud", "folders.json")
+
+
+def profiles():
+    paths = read_json(registry_path(), [])
+    # Shallow discovery of existing profiles; never walk Downloads, home or NAS recursively.
+    home = os.path.expanduser("~")
+    candidates = [home, os.getcwd()]
+    for parent in (home, os.path.join(home, "Documents")):
+        try:
+            with os.scandir(parent) as entries:
+                candidates.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
+        except OSError:
+            pass
+    return sorted({p for p in paths + candidates if os.path.isfile(os.path.join(p, CFG))})
+
+
+def register(path):
+    paths = read_json(registry_path(), [])
+    if path not in paths:
+        os.makedirs(os.path.dirname(registry_path()), exist_ok=True)
+        write_json(registry_path(), sorted(set(paths + [path])))
+
+
+def unregister(path):
+    p = registry_path()
+    if os.path.isfile(p):
+        write_json(p, [x for x in read_json(p, []) if x != path])
+
+
+def mount_sources():
+    result = []
+    try:
+        with open("/etc/fstab") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) < 4 or line.lstrip().startswith("#"):
+                    continue
+                source, target, fs = fields[:3]
+                if fs not in ("cifs", "smbfs", "nfs", "nfs4", "sshfs", "fuse.sshfs"):
+                    continue
+                decode = lambda v: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), v)
+                result.append({"source": decode(source), "target": decode(target), "type": fs})
+    except OSError:
+        pass
+    return result
+
+
 # ---------------------------------------------------------------- planning
 def plan(L, R, S):
     acts = []
@@ -321,8 +428,9 @@ def plan(L, R, S):
 # ---------------------------------------------------------------- sync
 def sync(force=False):
     check_remote()
-    R, RD, _ = _scan(remote, False)
-    L, LD, stubs = _scan(root, True)
+    scan = scan_selected if cfg.get("lazy") else _scan
+    R, RD, _ = scan(remote, False)
+    L, LD, stubs = scan(root, True)
     S = state["files"]
     acts = plan(L, R, S)
 
@@ -386,7 +494,7 @@ def sync(force=False):
             rmf(local(rel) + SUF)
 
     # folders (so empty folders and their Unity .meta files stay consistent)
-    BD = set(state["dirs"])
+    BD = {d for d in state["dirs"] if not cfg.get("lazy") or selected_path(d)}
     cand = LD | RD | BD
     mk_remote = sorted(d for d in cand if d in LD and d not in RD and d not in BD)
     mk_local = sorted(d for d in cand if d in RD and d not in LD and d not in BD)
@@ -434,6 +542,9 @@ def sync(force=False):
 def cmd_init(a):
     global root, remote, cfg, state
     root, remote = os.path.abspath(a.local), os.path.abspath(a.remote)
+    root, remote = os.path.realpath(root), os.path.realpath(remote)
+    if os.path.commonpath([root, remote]) in (root, remote):
+        raise Stop("Source and local folders must be separate and not nested.")
     if os.path.exists(os.path.join(root, CFG)):
         raise Stop(f"{root} is already a cloud folder (cloud uninit first to redo it).")
     os.makedirs(root, exist_ok=True)
@@ -441,11 +552,16 @@ def cmd_init(a):
            "max_deletes": 100, "trash_days": 30, "auto": 0}
     state = {"files": {}, "dirs": []}
     check_remote()
+    cfg["lazy"] = not getattr(a, "full_index", False)
     save_cfg()
     save_state()
-    with locked():
-        sync()
+    register(root)
+    if not cfg["lazy"]:
+        with locked():
+            sync()
     print("Ready:", root)
+    if cfg["lazy"]:
+        print("Lazy browsing enabled; no remote tree indexed. Pin a folder to download and sync it.")
 
 
 def cmd_sync(a):
@@ -473,6 +589,10 @@ def cmd_pin(a):
     check_remote()
     for p in a.paths:
         rel = to_rel(p)
+        if any(bad(part) for part in rel.split(os.sep) if part):
+            raise Stop("Path is excluded from sync: " + rel)
+        if os.path.commonpath([os.path.realpath(remote), os.path.realpath(far(rel))]) != os.path.realpath(remote):
+            raise Stop("Path leaves the source folder through a symlink: " + rel)
         if not os.path.exists(far(rel)):
             out("not on server: " + rel)
             continue
@@ -555,6 +675,7 @@ def cmd_status(a):
     print(f"Server:       {remote} ({'online' if online else 'OFFLINE'})")
     print(f"Auto sync:    {'every %d s' % cfg['auto'] if cfg['auto'] else 'off'}")
     print(f"Last sync:    {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last)) if last else 'never'}")
+    print("Browsing:     " + ("lazy; only selected paths scanned" if cfg.get("lazy") else "full placeholder index"))
     print("Pinned:       " + (", ".join(p or "(everything)" for p in cfg["pinned"]) or "(nothing)"))
 
 
@@ -568,6 +689,7 @@ def cmd_uninit(a):
         for f in fns:
             if f.endswith(SUF):
                 rmf(os.path.join(dp, f))
+    unregister(root)
     for n in (CFG, STATE, LOCK, LOG):
         rmf(os.path.join(root, n))
     print("Done. Downloaded files are untouched; trash (if any) is in", os.path.join(root, TRASH))
@@ -651,13 +773,290 @@ def cmd_auto(a):
         print(f"Auto sync: {'ON, every %d s' % cfg['auto'] if cfg['auto'] else 'off'}")
 
 
+# ---------------------------------------------------------------- interactive manager
+def cmd_ui(args):
+    import curses
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise Stop("Interactive mode needs a terminal. Try cloud --help or cloud list.")
+
+    def app(screen):
+        curses.curs_set(0)
+        screen.keypad(True)
+
+        def draw(title, rows, selected=0, footer="↑↓ choose  Enter select  Esc back  q quit", note=""):
+            screen.erase()
+            h, w = screen.getmaxyx()
+            def put(y, text, attr=0):
+                if 0 <= y < h and w > 1:
+                    try:
+                        screen.addnstr(y, 1, str(text).replace("\n", " "), w-2, attr)
+                    except curses.error:
+                        pass
+            put(0, "CLOUD · " + title, curses.A_BOLD)
+            put(1, note)
+            count = max(1, h-5)
+            offset = max(0, selected-count+1)
+            for y, idx in enumerate(range(offset, min(len(rows), offset+count)), 3):
+                put(y, ("› " if idx == selected else "  ") + rows[idx], curses.A_REVERSE if idx == selected else 0)
+            put(h-1, footer, curses.A_DIM)
+            screen.refresh()
+
+        def choose(title, rows, note="", footer=None):
+            if not rows:
+                return None
+            idx = 0
+            while True:
+                kw = {"note": note}
+                if footer:
+                    kw["footer"] = footer
+                draw(title, rows, idx, **kw)
+                key = screen.getch()
+                if key in (27, ord('q'), curses.KEY_LEFT):
+                    return None
+                if key in (curses.KEY_DOWN, ord('j')):
+                    idx = (idx+1) % len(rows)
+                elif key in (curses.KEY_UP, ord('k')):
+                    idx = (idx-1) % len(rows)
+                elif key == curses.KEY_NPAGE:
+                    idx = min(len(rows)-1, idx+max(1, screen.getmaxyx()[0]-5))
+                elif key == curses.KEY_PPAGE:
+                    idx = max(0, idx-max(1, screen.getmaxyx()[0]-5))
+                elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                    return idx
+
+        def message(title, text):
+            lines = str(text).splitlines() or ["Done."]
+            choose(title, lines + ["Back"], footer="↑↓ scroll  Enter/Esc return")
+
+        def prompt(title, default=""):
+            text = default
+            while True:
+                draw(title, [text + "▏"], note="Enter accepts · Esc cancels · Ctrl-U clears")
+                key = screen.get_wch()
+                if key == '\x1b':
+                    return None
+                if key in ('\n', '\r'):
+                    return text
+                if key == '\x15':
+                    text = ""
+                elif key in ('\b', '\x7f', curses.KEY_BACKSPACE):
+                    text = text[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    text += key
+
+        def confirm(title, description):
+            return choose(title, ["Cancel", "Confirm"], note=description) == 1
+
+        def work(title, fn):
+            # UI runs on the main thread; the worker may block on a slow NAS.
+            # Keep it responsive to resize and show that work is still active.
+            result = {}
+            output = io.StringIO()
+            def run():
+                try:
+                    with contextlib.redirect_stdout(output):
+                        result["value"] = fn()
+                except Exception as exc:
+                    result["error"] = str(exc)
+            task = threading.Thread(target=run, daemon=True)
+            task.start()
+            screen.timeout(150)
+            while task.is_alive():
+                draw(title, ["Working…"], footer="Please wait; file operations finish safely before returning.")
+                screen.getch()
+            screen.timeout(-1)
+            if "error" in result:
+                message("Could not complete", result["error"])
+                return False, None
+            return True, (result.get("value"), output.getvalue())
+
+        def listing(path):
+            # Only enumerate immediate children. No recursive size or pin-state scans.
+            with os.scandir(path) as it:
+                entries = [(e.name, e.is_dir(follow_symlinks=False)) for e in it
+                           if not e.is_symlink() and not bad(e.name)]
+            return sorted(entries, key=lambda e: (not e[1], e[0].casefold()))
+
+        def pick_remote(start):
+            path = os.path.abspath(os.path.expanduser(start))
+            while True:
+                ok, result = work("Loading " + path, lambda: listing(path))
+                if not ok:
+                    return None
+                entries = [(n, d) for n, d in result[0] if d]
+                rows = ["Use this folder", ".. / parent"] + [n + "/" for n, _ in entries]
+                idx = choose("Choose source folder", rows, note=path)
+                if idx is None:
+                    return None
+                if idx == 0:
+                    return path
+                path = os.path.dirname(path) if idx == 1 else os.path.join(path, entries[idx-2][0])
+
+        def add():
+            sources = mount_sources()
+            rows = [e["target"] + "  ←  " + e["source"] for e in sources] + ["Enter another source path"]
+            idx = choose("Connect a folder", rows, note="Uses existing mounts; never edits fstab or mounts/unmounts shares.")
+            if idx is None:
+                return
+            start = sources[idx]["target"] if idx < len(sources) else prompt("Source folder", "/mnt/")
+            if not start:
+                return
+            source = pick_remote(start)
+            if not source:
+                return
+            dest = prompt("Local sync folder", os.path.expanduser("~/Documents/" + os.path.basename(source)))
+            if not dest:
+                return
+            dest = os.path.abspath(os.path.expanduser(dest))
+            source = os.path.realpath(source)
+            if os.path.commonpath([source, os.path.realpath(dest)]) in (source, os.path.realpath(dest)):
+                message("Invalid folder", "Source and destination must be separate, non-nested folders.")
+                return
+            if os.path.isdir(dest) and os.listdir(dest):
+                message("Choose an empty folder", "Use an empty or new destination so existing files cannot accidentally enter sync.")
+                return
+            ok, result = work("Creating connection", lambda: cmd_init(types.SimpleNamespace(remote=source, local=dest, full_index=False)))
+            if ok:
+                message("Connected", result[1])
+
+        def browse():
+            rel = ""
+            while True:
+                ok, result = work("Loading folder", lambda: listing(far(rel)))
+                if not ok:
+                    return
+                entries = result[0]
+                rows = ["Actions for this folder", ".. / back"]
+                for name, isdir in entries:
+                    r = os.path.join(rel, name)
+                    mark = "PIN" if covered(r) else "PART" if any(under(p, r) for p in cfg["pinned"]) else "online"
+                    rows.append(f"[{mark}] {name}" + ("/" if isdir else ""))
+                idx = choose("Browse · " + (rel or "/"), rows, note="Only this directory is loaded. PIN = available offline; PART = selected children.")
+                if idx is None:
+                    return
+                if idx == 1:
+                    if not rel:
+                        return
+                    rel = os.path.dirname(rel)
+                    continue
+                if idx == 0:
+                    item_actions(rel)
+                else:
+                    name, isdir = entries[idx-2]
+                    path = os.path.join(rel, name)
+                    if isdir:
+                        rel = path
+                    else:
+                        item_actions(path)
+
+        def item_actions(rel):
+            direct = rel in cfg["pinned"]
+            inherited = covered(rel) and not direct
+            note = "Pinned: syncs both ways and stays available offline." if covered(rel) else "Online only: no file contents downloaded."
+            if inherited:
+                message(rel, "Included by a pinned parent folder. Unpin that parent to change its selection.")
+                return
+            action = "Unpin · sync changes, then free local copies" if direct else "Pin · download and keep synced"
+            idx = choose(rel or "Entire source folder", [action, "Back"], note=note)
+            if idx != 0:
+                return
+            if not confirm("Unpin" if direct else "Pin", ("Release local copies of " if direct else "Download and sync ") + (rel or "EVERYTHING") + "?"):
+                return
+            def change():
+                with locked():
+                    (cmd_unpin if direct else cmd_pin)(types.SimpleNamespace(paths=[local(rel)]))
+            ok, result = work("Unpinning" if direct else "Pinning", change)
+            if ok:
+                message("Selection updated", result[1] or "Done.")
+
+        def manage(path):
+            load(path)
+            register(root)
+            while True:
+                auto = "ON · every %ss" % cfg["auto"] if cfg["auto"] else "OFF"
+                choices = ["Browse source · pin / unpin", "Pinned selections", "Sync now",
+                           "Auto sync: " + auto, "What gets synced / status",
+                           "Enable lazy browsing" if not cfg.get("lazy") else "Browsing: lazy (fast)",
+                           "Disconnect · keep downloaded files", "Back"]
+                idx = choose(os.path.basename(root) or root, choices, note=f"{remote}  ↔  {root}")
+                if idx is None or idx == 7:
+                    return
+                if idx == 0:
+                    browse()
+                elif idx == 1:
+                    pins = list(cfg["pinned"])
+                    i = choose("Pinned selections", [p or "Entire source folder" for p in pins] + ["Back"])
+                    if i is not None and i < len(pins):
+                        item_actions(pins[i])
+                elif idx == 2:
+                    def run_sync():
+                        with locked():
+                            sync()
+                    ok, result = work("Syncing selected files", run_sync)
+                    if ok:
+                        message("Sync finished", result[1])
+                elif idx == 3:
+                    def toggle():
+                        auto_off() if cfg["auto"] else auto_on(120)
+                    ok, result = work("Updating auto sync", toggle)
+                    if ok:
+                        message("Auto sync", result[1] or "Auto sync OFF. Files remain available locally.")
+                elif idx == 4:
+                    ok, result = work("Checking status", lambda: cmd_status(None))
+                    if not ok:
+                        continue
+                    message("Sync behavior", result[1] + "\n\nPinned paths: downloads and local edits/new files/deletions sync both ways."
+                            "\nUnpinned paths: browse online; no automatic download."
+                            "\nPreviously downloaded/tracked files remain synced until unpinned."
+                            "\nNewest version wins conflicts; older copy is saved (except .meta files)."
+                            "\nDeletions go to trash for %s days; limit %s deletions per sync." % (cfg["trash_days"], cfg["max_deletes"])
+                            + "\nExcluded names: " + ", ".join(cfg["exclude"])
+                            + "\nAuto OFF stops background sync; manual sync and pin/unpin still work.")
+                elif idx == 5:
+                    if cfg.get("lazy"):
+                        message("Lazy browsing", "Only pinned and previously tracked files are scanned. Browse folders to select more.")
+                    elif confirm("Enable lazy browsing?", "Keeps pins and downloaded files; stops indexing unselected remote folders."):
+                        with locked():
+                            cfg["lazy"] = True
+                            save_cfg()
+                        message("Lazy browsing enabled", "Existing placeholders remain; no full tree cleanup or scan was needed.")
+                elif idx == 6:
+                    if confirm("Disconnect this cloud folder?", "Stops background sync; removes placeholders/settings. Downloaded files stay. Source share is untouched."):
+                        def disconnect():
+                            with locked():
+                                cmd_uninit(types.SimpleNamespace(yes=True))
+                        ok, result = work("Disconnecting", disconnect)
+                        if ok:
+                            message("Disconnected", result[1])
+                            return
+
+        if args.dir:
+            manage(os.path.abspath(os.path.expanduser(args.dir)))
+        while True:
+            paths = profiles()
+            rows = [os.path.basename(p) + "  ·  " + p for p in paths] + ["+ Connect a folder", "Quit"]
+            idx = choose("Folders", rows, note="Separate local sync folders using your existing mounted shares.")
+            if idx is None or idx == len(paths)+1:
+                return
+            try:
+                if idx == len(paths):
+                    add()
+                else:
+                    manage(paths[idx])
+            except (Stop, OSError, ValueError) as exc:
+                message("Could not complete", str(exc))
+
+    curses.wrapper(app)
+
+
 # ---------------------------------------------------------------- main
 def main():
     global QUIET
-    ap = argparse.ArgumentParser(prog="cloud", description="iCloud-style folder for a mounted share")
+    ap = argparse.ArgumentParser(prog="cloud", description="Interactive selective sync for existing mounted shares (run cloud to open the manager)")
     ap.add_argument("-C", dest="dir", help="cloud folder (default: the one you are in)")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
     i = sub.add_parser("init", help="create a cloud folder")
+    i.add_argument("--full-index", action="store_true", help="create placeholders for the entire tree (slow)")
     i.add_argument("remote", help="mounted share directory")
     i.add_argument("local", help="local cloud folder to create")
     s = sub.add_parser("sync", help="sync now")
@@ -674,13 +1073,24 @@ def main():
     u.add_argument("--yes", action="store_true")
     sub.add_parser("status")
     sub.add_parser("pinned")
+    sub.add_parser("ui", help="interactive arrow-key manager")
+    sub.add_parser("list", help="list registered cloud folders")
     a = ap.parse_args()
     QUIET = getattr(a, "quiet", False)
     try:
+        if a.cmd in (None, "ui"):
+            cmd_ui(a)
+            return
+        if a.cmd == "list":
+            for path in profiles():
+                c = read_json(os.path.join(path, CFG), {})
+                print(path + " <- " + c.get("remote", "?"))
+            return
         if a.cmd == "init":
             cmd_init(a)
             return
         load(a.dir)
+        register(root)
         if a.cmd in ("pin", "unpin", "rm"):
             with locked():
                 {"pin": cmd_pin, "unpin": cmd_unpin, "rm": cmd_rm}[a.cmd](a)
