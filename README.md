@@ -30,7 +30,9 @@ cloud
 Run `cloud`. Use Up/Down and Enter, Esc to go back, or q to leave a screen.
 
 1. Choose **Connect a folder**.
-2. Choose an existing source such as `/mnt/nas` (read from fstab), or type a path.
+2. Choose an existing source such as `/mnt/nas` (read from fstab) or a mounted
+   macOS SMB/NFS share under `/Volumes`, or type a path. Use Ctrl-U to clear the
+   suggested path before typing a replacement.
 3. Browse **Media → Stems → Use this folder**.
 4. Accept `~/Documents/Stems`, or enter another empty/new local folder.
 5. Browse the source, select a song folder, open **Actions for this folder**,
@@ -92,4 +94,4 @@ Each local folder retains its own `.cloudsync.json` and sync state. Discovery ch
 only home and Documents one level deep; other locations become registered when
 created or accessed using `-C`.
 
-Run tests with `python3 test_cloud`. Tests use temporary local folders, never NAS data.
+Run tests with `python3 test_cloud.py`. Tests use temporary local folders, never NAS data.

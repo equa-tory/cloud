@@ -168,7 +168,7 @@ def far(rel):
 
 
 def excluded(name):
-    return any(fnmatch.fnmatch(name, p) for p in cfg["exclude"])
+    return any(fnmatch.fnmatch(name, p) for p in cfg.get("exclude", EXCLUDES))
 
 
 def bad(name):  # names the sync never touches, on either side
@@ -388,6 +388,17 @@ def mount_sources():
                 result.append({"source": decode(source), "target": decode(target), "type": fs})
     except OSError:
         pass
+    if sys.platform == "darwin":
+        try:
+            mounts = subprocess.check_output(["/sbin/mount"], text=True)
+        except (OSError, subprocess.CalledProcessError):
+            mounts = ""
+        for line in mounts.splitlines():
+            match = re.match(r"^(.*?) on (.*?) \((smbfs|nfs)(?:,|\))", line)
+            if match:
+                source, target, fs = match.groups()
+                if not any(e["target"] == target for e in result):
+                    result.append({"source": source, "target": target, "type": fs})
     return result
 
 
@@ -898,7 +909,7 @@ def cmd_ui(args):
             idx = choose("Connect a folder", rows, note="Uses existing mounts; never edits fstab or mounts/unmounts shares.")
             if idx is None:
                 return
-            start = sources[idx]["target"] if idx < len(sources) else prompt("Source folder", "/mnt/")
+            start = sources[idx]["target"] if idx < len(sources) else prompt("Source folder", "/Volumes/" if sys.platform == "darwin" else "/mnt/")
             if not start:
                 return
             source = pick_remote(start)

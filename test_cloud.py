@@ -17,7 +17,7 @@ class CloudTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.src = self.base/'remote'
         self.dst = self.base/'local'
         self.src.mkdir()
@@ -159,11 +159,40 @@ class CloudTests(unittest.TestCase):
 
     def test_fstab_discovery_does_not_read_credentials(self):
         fixture = '# comment\n//example/nas /mnt/nas cifs credentials=/private/secret 0 0\n/dev/sda / ext4 defaults 0 0\n'
-        with patch('builtins.open', mock_open(read_data=fixture)) as opened:
+        with patch.object(c.sys, 'platform', 'linux'), patch('builtins.open', mock_open(read_data=fixture)) as opened:
             entries = c.mount_sources()
             opened.assert_called_once_with('/etc/fstab')
         self.assertTrue(any(e['target'] == '/mnt/nas' for e in entries))
         self.assertTrue(all(set(e) == {'source', 'target', 'type'} for e in entries))
+
+    def test_browsing_before_first_connection_uses_default_excludes(self):
+        with patch.object(c, 'cfg', {}):
+            self.assertFalse(c.bad('1_Projects'))
+            self.assertTrue(c.bad('Library'))
+            self.assertTrue(c.bad('.DS_Store'))
+        with patch.object(c, 'cfg', {'exclude': []}):
+            self.assertFalse(c.bad('Library'))
+
+    def test_macos_discovers_finder_network_mounts(self):
+        fixture = ('/dev/disk3s1 on / (apfs, local)\n'
+                   '//equa@192.168.1.50/%40 on /Volumes/192.168.1.50 (smbfs, nodev, nosuid)\n'
+                   'nas:/shared on /Volumes/Shared Files (nfs, nodev)\n')
+        with patch.object(c.sys, 'platform', 'darwin'), \
+                patch('builtins.open', side_effect=FileNotFoundError), \
+                patch.object(c.subprocess, 'check_output', return_value=fixture):
+            entries = c.mount_sources()
+        self.assertEqual(entries, [
+            {'source': '//equa@192.168.1.50/%40', 'target': '/Volumes/192.168.1.50', 'type': 'smbfs'},
+            {'source': 'nas:/shared', 'target': '/Volumes/Shared Files', 'type': 'nfs'},
+        ])
+
+    def test_macos_mount_discovery_preserves_fstab_when_mount_fails(self):
+        fixture = '//example/share /Volumes/share smbfs defaults 0 0\n'
+        with patch.object(c.sys, 'platform', 'darwin'), \
+                patch('builtins.open', mock_open(read_data=fixture)), \
+                patch.object(c.subprocess, 'check_output', side_effect=OSError):
+            self.assertEqual(c.mount_sources(), [
+                {'source': '//example/share', 'target': '/Volumes/share', 'type': 'smbfs'}])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
