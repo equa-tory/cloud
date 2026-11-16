@@ -3,6 +3,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import os
+import plistlib
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace as Args
@@ -193,6 +194,93 @@ class CloudTests(unittest.TestCase):
                 patch.object(c.subprocess, 'check_output', side_effect=OSError):
             self.assertEqual(c.mount_sources(), [
                 {'source': '//example/share', 'target': '/Volumes/share', 'type': 'smbfs'}])
+
+    def test_interval_saved_while_off_and_reused_after_toggle(self):
+        self.init()
+        with patch.object(c, 'sh', return_value=True), \
+                patch.object(c, 'svc_files', return_value=[str(self.base/'sync.service'), str(self.base/'sync.timer')]), \
+                patch.object(c.sys, 'platform', 'linux'):
+            c.set_auto_interval(17)
+            self.assertEqual(c.cfg['auto'], 0)
+            c.load(str(self.dst))
+            c.cmd_auto(Args(mode='on', seconds=None))
+            self.assertEqual(c.cfg['auto'], 17)
+            c.auto_off()
+            c.load(str(self.dst))
+            self.assertEqual(c.cfg['auto'], 0)
+            self.assertEqual(c.cfg['auto_interval'], 17)
+            c.cmd_auto(Args(mode='on', seconds=None))
+            self.assertEqual(c.cfg['auto'], 17)
+
+    def test_active_linux_interval_restarts_timer_with_new_seconds(self):
+        self.init()
+        service, timer = self.base/'sync.service', self.base/'sync.timer'
+        with patch.object(c, 'sh', return_value=True) as sh, \
+                patch.object(c, 'svc_files', return_value=[str(service), str(timer)]), \
+                patch.object(c.sys, 'platform', 'linux'):
+            c.auto_on(120)
+            c.set_auto_interval(9)
+        self.assertEqual(c.cfg['auto'], 9)
+        self.assertIn('OnUnitActiveSec=9s', timer.read_text())
+        self.assertIn('AccuracySec=1s', timer.read_text())
+        self.assertEqual(sum(call.args == ('systemctl', '--user', 'restart', c.svc_name()+'.timer')
+                             for call in sh.call_args_list), 2)
+
+    def test_active_macos_interval_reloads_launch_agent(self):
+        self.init()
+        agent = self.base/'sync.plist'
+        with patch.object(c, 'sh', return_value=True) as sh, \
+                patch.object(c, 'svc_files', return_value=[str(agent)]), \
+                patch.object(c.sys, 'platform', 'darwin'):
+            c.auto_on(120)
+            c.set_auto_interval(7)
+        with agent.open('rb') as f:
+            self.assertEqual(plistlib.load(f)['StartInterval'], 7)
+        self.assertEqual(c.cfg['auto'], 7)
+        self.assertEqual(sum(call.args[:2] == ('launchctl', 'bootstrap') for call in sh.call_args_list), 2)
+
+    def test_invalid_interval_leaves_schedule_unchanged(self):
+        self.init()
+        c.cfg['auto'] = 120
+        with patch.object(c, 'sh') as sh:
+            for seconds in (0, -1):
+                with self.assertRaises(c.Stop):
+                    c.set_auto_interval(seconds)
+                with self.assertRaises(c.Stop):
+                    c.auto_on(seconds)
+            sh.assert_not_called()
+        self.assertEqual(c.cfg['auto'], 120)
+
+    def test_auto_submenu_can_save_interval_without_enabling_sync(self):
+        self.init()
+        keys = iter([ord('j'), ord('j'), ord('j'), 10,
+                     ord('j'), 10, '\x15', '5', '\n', 10,
+                     ord('q'), ord('q'), ord('q')])
+        class Screen:
+            def keypad(self, value): pass
+            def erase(self): pass
+            def getmaxyx(self): return (24, 100)
+            def addnstr(self, *args): pass
+            def refresh(self): pass
+            def timeout(self, value): pass
+            def getch(self): return next(keys)
+            def get_wch(self): return next(keys)
+        class Thread:
+            def __init__(self, target, **kw): self.target = target
+            def start(self): self.target()
+            def is_alive(self): return False
+        curses = Args(curs_set=lambda value: None, wrapper=lambda app: app(Screen()),
+                      A_BOLD=1, A_REVERSE=2, A_DIM=3, KEY_LEFT=260, KEY_DOWN=258,
+                      KEY_UP=259, KEY_NPAGE=338, KEY_PPAGE=339, KEY_ENTER=343,
+                      KEY_RIGHT=261, KEY_BACKSPACE=263, error=RuntimeError)
+        with patch.dict('sys.modules', {'curses': curses}), \
+                patch.object(c.sys.stdin, 'isatty', return_value=True), \
+                patch.object(c.sys.stdout, 'isatty', return_value=True), \
+                patch.object(c.threading, 'Thread', Thread):
+            c.cmd_ui(Args(dir=str(self.dst)))
+        c.load(str(self.dst))
+        self.assertEqual(c.cfg['auto'], 0)
+        self.assertEqual(c.cfg['auto_interval'], 5)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

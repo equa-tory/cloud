@@ -37,7 +37,11 @@ Run `cloud`. Use Up/Down and Enter, Esc to go back, or q to leave a screen.
 4. Accept `~/Documents/Stems`, or enter another empty/new local folder.
 5. Browse the source, select a song folder, open **Actions for this folder**,
    and choose **Pin**. Files show actions directly.
-6. Enable **Auto sync** to sync every two minutes, or use **Sync now** manually.
+6. Open **Auto sync** to turn it on/off or choose **Change interval** and enter a
+   positive whole number of seconds (default: 120). Changing the interval while
+   sync is on applies it immediately. While off, the interval is saved for the
+   next time you turn it on. Each connected folder keeps its own interval.
+   Use **Sync now** for a manual sync.
 
 A connection is created without walking the whole tree. The browser lists only
 the directory you open. Pinning downloads and scans that selection; large pinned
@@ -84,6 +88,7 @@ cloud -C ~/Documents/MyStems pin ~/Documents/MyStems/SomeSong
 cloud -C ~/Documents/MyStems unpin ~/Documents/MyStems/SomeSong
 cloud -C ~/Documents/MyStems sync
 cloud -C ~/Documents/MyStems auto on 120
+cloud -C ~/Documents/MyStems auto on         # reuse the saved interval
 cloud -C ~/Documents/MyStems auto off
 cloud -C ~/Documents/MyStems uninit          # prompts; keeps downloads
 ```

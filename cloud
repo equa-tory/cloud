@@ -123,6 +123,7 @@ def load(start=None):
     cfg.setdefault("max_deletes", 100)
     cfg.setdefault("trash_days", 30)
     cfg.setdefault("auto", 0)
+    cfg.setdefault("auto_interval", cfg["auto"] or 120)
     cfg.setdefault("lazy", False)
     remote = cfg["remote"]
     state = read_json(os.path.join(d, STATE), {})
@@ -727,7 +728,8 @@ def sh(*cmd):
 
 
 def auto_on(secs):
-    secs = max(30, secs)
+    if secs < 1:
+        raise Stop("Auto sync interval must be a positive number of seconds.")
     cmd = [sys.executable, os.path.realpath(__file__), "-C", root, "sync", "--quiet"]
     files = svc_files()
     os.makedirs(os.path.dirname(files[0]), exist_ok=True)
@@ -745,10 +747,12 @@ def auto_on(secs):
             f.write(f"[Unit]\nDescription=cloud sync of {root}\n\n[Service]\nType=oneshot\nExecStart={exe}\n")
         with open(files[1], "w") as f:
             f.write(f"[Unit]\nDescription=cloud sync timer for {root}\n\n[Timer]\n"
-                    f"OnBootSec=30\nOnUnitActiveSec={secs}s\n\n[Install]\nWantedBy=timers.target\n")
+                    f"OnBootSec=30\nOnUnitActiveSec={secs}s\nAccuracySec=1s\n\n[Install]\nWantedBy=timers.target\n")
         sh("systemctl", "--user", "daemon-reload")
-        ok = sh("systemctl", "--user", "enable", "--now", svc_name() + ".timer")
+        ok = (sh("systemctl", "--user", "enable", svc_name() + ".timer")
+              and sh("systemctl", "--user", "restart", svc_name() + ".timer"))
     cfg["auto"] = secs if ok else 0
+    cfg["auto_interval"] = secs
     save_cfg()
     if ok:
         print(f"Auto sync ON: every {secs} s (log: {os.path.join(root, LOG)})")
@@ -760,6 +764,8 @@ def auto_on(secs):
 
 
 def auto_off():
+    if cfg["auto"]:
+        cfg["auto_interval"] = cfg["auto"]
     files = svc_files()
     if sys.platform == "darwin":
         sh("launchctl", "bootout", f"gui/{os.getuid()}", files[0])
@@ -774,9 +780,20 @@ def auto_off():
         save_cfg()
 
 
+def set_auto_interval(secs):
+    if secs < 1:
+        raise Stop("Auto sync interval must be a positive number of seconds.")
+    if cfg["auto"]:
+        auto_on(secs)
+    else:
+        cfg["auto_interval"] = secs
+        save_cfg()
+        print(f"Interval saved: {secs} s. Auto sync is OFF.")
+
+
 def cmd_auto(a):
     if a.mode == "on":
-        auto_on(a.seconds)
+        auto_on(a.seconds if a.seconds is not None else cfg.get("auto_interval", cfg["auto"] or 120))
     elif a.mode == "off":
         auto_off()
         print("Auto sync OFF")
@@ -980,6 +997,33 @@ def cmd_ui(args):
             if ok:
                 message("Selection updated", result[1] or "Done.")
 
+        def auto_menu():
+            while True:
+                interval = cfg.get("auto_interval", cfg["auto"] or 120)
+                status = "ON · every %s s" % cfg["auto"] if cfg["auto"] else "OFF"
+                idx = choose("Auto sync", ["Turn off" if cfg["auto"] else "Turn on",
+                             "Change interval · %s seconds" % interval, "Back"], note=status)
+                if idx is None or idx == 2:
+                    return
+                if idx == 0:
+                    def toggle():
+                        auto_off() if cfg["auto"] else auto_on(interval)
+                    ok, result = work("Updating auto sync", toggle)
+                else:
+                    value = prompt("Auto sync interval in seconds", str(interval))
+                    if value is None:
+                        continue
+                    try:
+                        seconds = int(value)
+                        if seconds < 1:
+                            raise ValueError
+                    except ValueError:
+                        message("Invalid interval", "Enter a positive whole number of seconds.")
+                        continue
+                    ok, result = work("Updating interval", lambda: set_auto_interval(seconds))
+                if ok:
+                    message("Auto sync", result[1] or "Auto sync OFF. Files remain available locally.")
+
         def manage(path):
             load(path)
             register(root)
@@ -1007,11 +1051,7 @@ def cmd_ui(args):
                     if ok:
                         message("Sync finished", result[1])
                 elif idx == 3:
-                    def toggle():
-                        auto_off() if cfg["auto"] else auto_on(120)
-                    ok, result = work("Updating auto sync", toggle)
-                    if ok:
-                        message("Auto sync", result[1] or "Auto sync OFF. Files remain available locally.")
+                    auto_menu()
                 elif idx == 4:
                     ok, result = work("Checking status", lambda: cmd_status(None))
                     if not ok:
@@ -1079,7 +1119,7 @@ def main():
         sub.add_parser(name, help=h).add_argument("paths", nargs="+")
     au = sub.add_parser("auto", help="background sync on/off")
     au.add_argument("mode", nargs="?", choices=["on", "off"])
-    au.add_argument("seconds", nargs="?", type=int, default=120)
+    au.add_argument("seconds", nargs="?", type=int, help="interval in seconds (default: saved interval or 120)")
     u = sub.add_parser("uninit", help="forget this folder, keep downloaded files")
     u.add_argument("--yes", action="store_true")
     sub.add_parser("status")
